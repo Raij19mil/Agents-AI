@@ -1,0 +1,380 @@
+import os
+import re
+import pathlib
+from typing import TypedDict, Optional, List, Dict, Literal
+from pathlib import Path
+
+# LangChain imports
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain.chains.combine_documents import create_stuff_documents_chain
+
+# LangGraph imports
+from langgraph.graph import StateGraph, START, END
+
+# Pydantic imports
+from pydantic import BaseModel, Field
+
+class ServiceDeskAgent:
+    def __init__(self, google_api_key: str, documents_path: str = "./documents/"):
+        """
+        Initialize the Service Desk Agent
+        
+        Args:
+            google_api_key: Google API key for Gemini models
+            documents_path: Path to directory containing PDF policy documents
+        """
+        self.google_api_key = google_api_key
+        self.documents_path = documents_path
+        
+        # Initialize LLMs
+        self.llm_triagem = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0.0,
+            api_key=google_api_key
+        )
+        
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            google_api_key=google_api_key
+        )
+        
+        # Initialize components
+        self.vectorstore = None
+        self.retriever = None
+        self.document_chain = None
+        self.triagem_chain = None
+        self.workflow = None
+        
+        self._setup_triagem()
+        self._setup_rag()
+        self._setup_workflow()
+    
+    def _setup_triagem(self):
+        """Setup the triage system"""
+        
+        # Triagem prompt
+        self.TRIAGEM_PROMPT = (
+            "Você é um triador de Service Desk para políticas internas da empresa Carraro Desenvolvimento. "
+            "Dada a mensagem do usuário, retorne SOMENTE um JSON com:\n"
+            "{\n"
+            '  "decisao": "AUTO_RESOLVER" | "PEDIR_INFO" | "ABRIR_CHAMADO",\n'
+            '  "urgencia": "BAIXA" | "MEDIA" | "ALTA",\n'
+            '  "campos_faltantes": ["..."]\n'
+            "}\n"
+            "Regras:\n"
+            '- **AUTO_RESOLVER**: Perguntas claras sobre regras ou procedimentos descritos nas políticas (Ex: "Posso reembolsar a internet do meu home office?", "Como funciona a política de alimentação em viagens?").\n'
+            '- **PEDIR_INFO**: Mensagens vagas ou que faltam informações para identificar o tema ou contexto (Ex: "Preciso de ajuda com uma política", "Tenho uma dúvida geral").\n'
+            '- **ABRIR_CHAMADO**: Pedidos de exceção, liberação, aprovação ou acesso especial, ou quando o usuário explicitamente pede para abrir um chamado (Ex: "Quero exceção para trabalhar 5 dias remoto.", "Solicito liberação para anexos externos.", "Por favor, abra um chamado para o RH.").'
+            "Analise a mensagem e decida a ação mais apropriada."
+        )
+        
+        # Pydantic model for structured output
+        class TriagemOut(BaseModel):
+            decisao: Literal["AUTO_RESOLVER", "PEDIR_INFO", "ABRIR_CHAMADO"]
+            urgencia: Literal["BAIXA", "MEDIA", "ALTA"]
+            campos_faltantes: List[str] = Field(default_factory=list)
+        
+        self.triagem_chain = self.llm_triagem.with_structured_output(TriagemOut)
+    
+    def _setup_rag(self):
+        """Setup RAG system with document loading and vector store"""
+        
+        # Load documents
+        docs = self._load_documents()
+        
+        if not docs:
+            print("Warning: No documents loaded. RAG functionality will be limited.")
+            return
+        
+        # Split documents into chunks
+        splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)
+        chunks = splitter.split_documents(docs)
+        
+        # Create vector store
+        self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
+        self.retriever = self.vectorstore.as_retriever(
+            search_type="similarity_score_threshold",
+            search_kwargs={"score_threshold": 0.3, "k": 4}
+        )
+        
+        # Create document chain for RAG
+        prompt_rag = ChatPromptTemplate.from_messages([
+            ("system",
+             "Você é um Assistente de Políticas Internas (RH/IT) da empresa Carraro Desenvolvimento. "
+             "Responda SOMENTE com base no contexto fornecido. "
+             "Se não houver base suficiente, responda apenas 'Não sei'."),
+            ("human", "Pergunta: {input}\n\nContexto:\n{context}")
+        ])
+        
+        self.document_chain = create_stuff_documents_chain(self.llm_triagem, prompt_rag)
+    
+    def _load_documents(self):
+        """Load PDF documents from the specified directory"""
+        docs = []
+        
+        if not os.path.exists(self.documents_path):
+            print(f"Documents directory {self.documents_path} does not exist.")
+            return docs
+        
+        for pdf_file in Path(self.documents_path).glob("*.pdf"):
+            try:
+                loader = PyMuPDFLoader(str(pdf_file))
+                docs.extend(loader.load())
+                print(f"Loaded document: {pdf_file.name}")
+            except Exception as e:
+                print(f"Error loading {pdf_file.name}: {e}")
+        
+        print(f"Total documents loaded: {len(docs)}")
+        return docs
+    
+    def _setup_workflow(self):
+        """Setup the LangGraph workflow"""
+        
+        # State definition
+        class AgentState(TypedDict, total=False):
+            pergunta: str
+            triagem: dict
+            resposta: Optional[str]
+            citacoes: List[dict]
+            rag_sucesso: bool
+            acao_final: str
+        
+        # Keywords for opening tickets
+        self.KEYWORDS_ABRIR_TICKET = [
+            "aprovação", "exceção", "liberação", "abrir ticket", 
+            "abrir chamado", "acesso especial"
+        ]
+        
+        # Node functions
+        def node_triagem(state: AgentState) -> AgentState:
+            return {"triagem": self.triagem(state["pergunta"])}
+        
+        def node_auto_resolver(state: AgentState) -> AgentState:
+            resposta_rag = self.perguntar_politica_RAG(state["pergunta"])
+            
+            update: AgentState = {
+                "resposta": resposta_rag["answer"],
+                "citacoes": resposta_rag.get("citacoes", []),
+                "rag_sucesso": resposta_rag["contexto_encontrado"],
+            }
+            
+            if resposta_rag["contexto_encontrado"]:
+                update["acao_final"] = "AUTO_RESOLVER"
+            
+            return update
+        
+        def node_pedir_info(state: AgentState) -> AgentState:
+            faltantes = state["triagem"].get("campos_faltantes", [])
+            if faltantes:
+                detalhe = ", ".join(faltantes)
+            else:
+                detalhe = "Tema e contexto específico"
+            
+            return {
+                "resposta": f"Para avançar, preciso que detalhe: {detalhe}",
+                "citacoes": [],
+                "acao_final": "PEDIR_INFO"
+            }
+        
+        def node_abrir_chamado(state: AgentState) -> AgentState:
+            triagem = state["triagem"]
+            
+            return {
+                "resposta": f"Abrindo chamado com urgência {triagem['urgencia']}. Descrição: {state['pergunta'][:140]}",
+                "citacoes": [],
+                "acao_final": "ABRIR_CHAMADO"
+            }
+        
+        # Decision functions
+        def decidir_pos_triagem(state: AgentState) -> str:
+            decisao = state["triagem"]["decisao"]
+            
+            if decisao == "AUTO_RESOLVER": 
+                return "auto"
+            if decisao == "PEDIR_INFO": 
+                return "info"
+            if decisao == "ABRIR_CHAMADO": 
+                return "chamado"
+        
+        def decidir_pos_auto_resolver(state: AgentState) -> str:
+            if state.get("rag_sucesso"):
+                return "ok"
+            
+            pergunta_lower = (state["pergunta"] or "").lower()
+            
+            if any(k in pergunta_lower for k in self.KEYWORDS_ABRIR_TICKET):
+                return "chamado"
+            
+            return "info"
+        
+        # Build workflow
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("triagem", node_triagem)
+        workflow.add_node("auto_resolver", node_auto_resolver)
+        workflow.add_node("pedir_info", node_pedir_info)
+        workflow.add_node("abrir_chamado", node_abrir_chamado)
+        
+        # Add edges
+        workflow.add_edge(START, "triagem")
+        workflow.add_conditional_edges("triagem", decidir_pos_triagem, {
+            "auto": "auto_resolver",
+            "info": "pedir_info",
+            "chamado": "abrir_chamado"
+        })
+        
+        workflow.add_conditional_edges("auto_resolver", decidir_pos_auto_resolver, {
+            "info": "pedir_info",
+            "chamado": "abrir_chamado",
+            "ok": END
+        })
+        
+        workflow.add_edge("pedir_info", END)
+        workflow.add_edge("abrir_chamado", END)
+        
+        self.workflow = workflow.compile()
+    
+    def triagem(self, mensagem: str) -> Dict:
+        """Perform triage on a message"""
+        saida = self.triagem_chain.invoke([
+            SystemMessage(content=self.TRIAGEM_PROMPT),
+            HumanMessage(content=mensagem)
+        ])
+        
+        return saida.model_dump()
+    
+    def _clean_text(self, s: str) -> str:
+        """Clean text for processing"""
+        return re.sub(r"\s+", " ", s or "").strip()
+    
+    def extrair_trecho(self, texto: str, query: str, janela: int = 240) -> str:
+        """Extract relevant excerpt from text"""
+        txt = self._clean_text(texto)
+        termos = [t.lower() for t in re.findall(r"\w+", query or "") if len(t) >= 4]
+        pos = -1
+        for t in termos:
+            pos = txt.lower().find(t)
+            if pos != -1: 
+                break
+        if pos == -1: 
+            pos = 0
+        ini, fim = max(0, pos - janela//2), min(len(txt), pos + janela//2)
+        return txt[ini:fim]
+    
+    def formatar_citacoes(self, docs_rel: List, query: str) -> List[Dict]:
+        """Format citations from relevant documents"""
+        cites, seen = [], set()
+        for d in docs_rel:
+            src = pathlib.Path(d.metadata.get("source", "")).name
+            page = int(d.metadata.get("page", 0)) + 1
+            key = (src, page)
+            if key in seen:
+                continue
+            seen.add(key)
+            cites.append({
+                "documento": src, 
+                "pagina": page, 
+                "trecho": self.extrair_trecho(d.page_content, query)
+            })
+        return cites[:3]
+    
+    def perguntar_politica_RAG(self, pergunta: str) -> Dict:
+        """Ask a question using RAG"""
+        if not self.retriever:
+            return {
+                "answer": "Não sei.",
+                "citacoes": [],
+                "contexto_encontrado": False
+            }
+        
+        docs_relacionados = self.retriever.invoke(pergunta)
+        
+        if not docs_relacionados:
+            return {
+                "answer": "Não sei.",
+                "citacoes": [],
+                "contexto_encontrado": False
+            }
+        
+        answer = self.document_chain.invoke({
+            "input": pergunta,
+            "context": docs_relacionados
+        })
+        
+        txt = (answer or "").strip()
+        
+        if txt.rstrip(".!?") == "Não sei":
+            return {
+                "answer": "Não sei.",
+                "citacoes": [],
+                "contexto_encontrado": False
+            }
+        
+        return {
+            "answer": txt,
+            "citacoes": self.formatar_citacoes(docs_relacionados, pergunta),
+            "contexto_encontrado": True
+        }
+    
+    def process_question(self, pergunta: str) -> Dict:
+        """Process a user question through the complete workflow"""
+        if not self.workflow:
+            raise ValueError("Workflow not initialized")
+        
+        return self.workflow.invoke({"pergunta": pergunta})
+    
+    def get_workflow_graph(self):
+        """Get the workflow graph for visualization"""
+        if self.workflow:
+            return self.workflow.get_graph()
+        return None
+
+
+# Usage example and configuration
+def create_service_desk_agent():
+    """Factory function to create a configured Service Desk Agent"""
+    
+    # Get API key from environment variable
+    google_api_key = os.getenv('GOOGLE_API_KEY')
+    if not google_api_key:
+        raise ValueError("GOOGLE_API_KEY environment variable is required")
+    
+    # Configure documents path
+    documents_path = os.getenv('DOCUMENTS_PATH', './documents/')
+    
+    # Create and return agent
+    agent = ServiceDeskAgent(
+        google_api_key=google_api_key,
+        documents_path=documents_path
+    )
+    
+    return agent
+
+
+if __name__ == "__main__":
+    # Example usage
+    try:
+        agent = create_service_desk_agent()
+        
+        # Process a sample question
+        sample_question = "Posso reembolsar a internet?"
+        result = agent.process_question(sample_question)
+        
+        print(f"Question: {sample_question}")
+        print(f"Decision: {result.get('triagem', {}).get('decisao')}")
+        print(f"Action: {result.get('acao_final')}")
+        print(f"Answer: {result.get('resposta')}")
+        
+        if result.get('citacoes'):
+            print("Citations:")
+            for citation in result['citacoes']:
+                print(f"  - Document: {citation['documento']}, Page: {citation['pagina']}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
