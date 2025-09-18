@@ -1,8 +1,11 @@
 import os
 import re
 import pathlib
+import time
 from typing import TypedDict, Optional, List, Dict, Literal
 from pathlib import Path
+from threading import Thread
+from flask import Flask, request, jsonify, render_template_string
 
 # LangChain imports
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -18,6 +21,8 @@ from langgraph.graph import StateGraph, START, END
 
 # Pydantic imports
 from pydantic import BaseModel, Field
+
+app = Flask(__name__)
 
 class ServiceDeskAgent:
     def __init__(self, google_api_key: str, documents_path: str = "./documents/"):
@@ -49,6 +54,7 @@ class ServiceDeskAgent:
         self.document_chain = None
         self.triagem_chain = None
         self.workflow = None
+        self.ativo = True
         
         self._setup_triagem()
         self._setup_rag()
@@ -329,64 +335,393 @@ class ServiceDeskAgent:
         
         return self.workflow.invoke({"pergunta": pergunta})
     
-    def get_workflow_graph(self):
-        """Get the workflow graph for visualization"""
-        if self.workflow:
-            return self.workflow.get_graph()
-        return None
+    def manter_ativo(self):
+        """Função para manter o agente sempre ativo"""
+        while self.ativo:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Service Desk Agent ativo...")
+            time.sleep(300)  # Verifica a cada 5 minutos
 
-
-# Usage example and configuration
-def create_service_desk_agent():
-    """Factory function to create a configured Service Desk Agent"""
-    
-    # Get API key from environment variable
+# Initialize Service Desk Agent
+print("🚀 Inicializando Service Desk Agent...")
+try:
     google_api_key = os.getenv('GOOGLE_API_KEY')
     if not google_api_key:
         raise ValueError("GOOGLE_API_KEY environment variable is required")
     
-    # Configure documents path
     documents_path = os.getenv('DOCUMENTS_PATH', './documents/')
-    
-    # Create and return agent
-    agent = ServiceDeskAgent(
-        google_api_key=google_api_key,
-        documents_path=documents_path
-    )
-    
-    return agent
+    agent = ServiceDeskAgent(google_api_key, documents_path)
+    print("✅ Service Desk Agent inicializado com sucesso!")
+except Exception as e:
+    print(f"❌ Erro ao inicializar o agente: {e}")
+    agent = None
 
+# Template HTML para interface web
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎯 Service Desk Carraro</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        
+        .chat-container {
+            height: 500px;
+            overflow-y: auto;
+            padding: 20px;
+            background: #f8f9fa;
+        }
+        
+        .message {
+            margin-bottom: 20px;
+            padding: 15px;
+            border-radius: 12px;
+            max-width: 85%;
+            animation: fadeIn 0.3s ease;
+        }
+        
+        .user-message {
+            background: #667eea;
+            color: white;
+            margin-left: auto;
+            text-align: right;
+        }
+        
+        .agent-message {
+            background: white;
+            color: #333;
+            border: 2px solid #e9ecef;
+            margin-right: auto;
+        }
+        
+        .citation {
+            background: #e7f3ff;
+            border-left: 4px solid #667eea;
+            margin-top: 10px;
+            padding: 8px;
+            font-size: 0.9em;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+        
+        .auto-resolver { background: #d4edda; color: #155724; }
+        .pedir-info { background: #fff3cd; color: #856404; }
+        .abrir-chamado { background: #f8d7da; color: #721c24; }
+        
+        .input-container {
+            padding: 20px;
+            background: white;
+            border-top: 1px solid #e9ecef;
+            display: flex;
+            gap: 10px;
+        }
+        
+        .input-container textarea {
+            flex: 1;
+            padding: 15px;
+            border: 2px solid #e9ecef;
+            border-radius: 15px;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s;
+            resize: vertical;
+            min-height: 50px;
+            max-height: 120px;
+        }
+        
+        .input-container textarea:focus { border-color: #667eea; }
+        
+        .send-btn {
+            padding: 15px 25px;
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            border-radius: 15px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: transform 0.2s;
+            height: fit-content;
+        }
+        
+        .send-btn:hover { transform: scale(1.05); }
+        .send-btn:disabled { opacity: 0.6; transform: none; }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+            color: #667eea;
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 Service Desk Carraro</h1>
+            <p>Assistente de Políticas Internas - RH e TI</p>
+        </div>
+        
+        <div class="chat-container" id="chatContainer">
+            <div class="message agent-message">
+                <div class="status-badge auto-resolver">SISTEMA ATIVO</div>
+                Olá! Sou seu assistente para dúvidas sobre políticas internas da Carraro Desenvolvimento.<br><br>
+                <strong>Como posso ajudar:</strong><br>
+                • Esclarecer políticas de RH e TI<br>
+                • Orientar sobre procedimentos<br>
+                • Abrir chamados quando necessário<br><br>
+                Digite sua dúvida abaixo! 😊
+            </div>
+        </div>
+        
+        <div class="loading" id="loading">
+            🤖 Analisando sua solicitação...
+        </div>
+        
+        <div class="input-container">
+            <textarea 
+                id="messageInput" 
+                placeholder="Digite sua dúvida sobre políticas da empresa..." 
+                maxlength="1000"
+            ></textarea>
+            <button onclick="enviarMensagem()" id="sendBtn" class="send-btn">
+                Enviar
+            </button>
+        </div>
+    </div>
 
-if __name__ == "__main__":
-    # Example usage
+    <script>
+        const chatContainer = document.getElementById('chatContainer');
+        const messageInput = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const loading = document.getElementById('loading');
+        
+        messageInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                enviarMensagem();
+            }
+        });
+        
+        async function enviarMensagem() {
+            const mensagem = messageInput.value.trim();
+            if (!mensagem) return;
+            
+            adicionarMensagem(mensagem, 'user');
+            messageInput.value = '';
+            sendBtn.disabled = true;
+            loading.style.display = 'block';
+            
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mensagem: mensagem })
+                });
+                
+                const data = await response.json();
+                
+                if (data.sucesso) {
+                    adicionarRespostaAgente(data);
+                } else {
+                    throw new Error(data.erro || 'Erro desconhecido');
+                }
+                
+            } catch (error) {
+                console.error('Erro:', error);
+                adicionarMensagem('❌ Desculpe, ocorreu um erro. Tente novamente.', 'agent');
+            } finally {
+                sendBtn.disabled = false;
+                loading.style.display = 'none';
+                messageInput.focus();
+            }
+        }
+        
+        function adicionarMensagem(texto, tipo) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${tipo}-message`;
+            messageDiv.textContent = texto;
+            
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function adicionarRespostaAgente(data) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message agent-message';
+            
+            // Status badge
+            const acao = data.acao_final || '';
+            let badgeClass = 'auto-resolver';
+            if (acao === 'PEDIR_INFO') badgeClass = 'pedir-info';
+            if (acao === 'ABRIR_CHAMADO') badgeClass = 'abrir-chamado';
+            
+            let html = `<div class="status-badge ${badgeClass}">${acao.replace('_', ' ')}</div>`;
+            html += data.resposta;
+            
+            // Citações
+            if (data.citacoes && data.citacoes.length > 0) {
+                html += '<br><br><strong>📚 Fontes:</strong>';
+                data.citacoes.forEach(cite => {
+                    html += `<div class="citation">
+                        <strong>${cite.documento}</strong> (Página ${cite.pagina})<br>
+                        <em>"${cite.trecho}"</em>
+                    </div>`;
+                });
+            }
+            
+            messageDiv.innerHTML = html;
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Endpoint para chat com o Service Desk Agent"""
     try:
-        agent = create_service_desk_agent()
+        if not agent:
+            return jsonify({'erro': 'Service Desk Agent não inicializado'}), 500
         
-        # Process a sample question
-        sample_question = "Posso reembolsar a internet?"
-        result = agent.process_question(sample_question)
+        dados = request.get_json()
+        mensagem = dados.get('mensagem', '').strip()
         
-        print(f"Question: {sample_question}")
-        print(f"Decision: {result.get('triagem', {}).get('decisao')}")
-        print(f"Action: {result.get('acao_final')}")
-        print(f"Answer: {result.get('resposta')}")
+        if not mensagem:
+            return jsonify({'erro': 'Mensagem não fornecida'}), 400
         
-        if result.get('citacoes'):
-            print("Citations:")
-            for citation in result['citacoes']:
-                print(f"  - Document: {citation['documento']}, Page: {citation['pagina']}")
+        # Processa a pergunta através do workflow
+        resultado = agent.process_question(mensagem)
         
+        return jsonify({
+            'sucesso': True,
+            'resposta': resultado.get('resposta', 'Não foi possível processar sua solicitação.'),
+            'acao_final': resultado.get('acao_final'),
+            'triagem': resultado.get('triagem'),
+            'citacoes': resultado.get('citacoes', []),
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        })
+    
     except Exception as e:
-        print(f"Error: {e}")
-services:
-  - type: web
-    name: Agents-AI
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.9.18
-      - key: FLASK_ENV
-        value: production
+        print(f"Erro no chat: {e}")
+        return jsonify({'erro': f'Erro interno: {str(e)}'}), 500
+
+@app.route('/status')
+def status():
+    """Endpoint para verificar status do agente"""
+    return jsonify({
+        'ativo': agent is not None and agent.ativo,
+        'nome': 'Service Desk Carraro',
+        'versao': '2.0',
+        'documentos_carregados': len(agent.vectorstore.index_to_docstore_id) if agent and agent.vectorstore else 0,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy' if agent else 'unhealthy',
+        'timestamp': time.time()
+    })
+
+@app.route('/webhook', methods=['POST'])
+def webhook_whatsapp():
+    """Webhook para integração com WhatsApp Business API"""
+    try:
+        if not agent:
+            return jsonify({'erro': 'Agent não disponível'}), 500
+            
+        dados = request.get_json()
+        
+        if 'messages' in dados and dados['messages']:
+            mensagem = dados['messages'][0]
+            texto = mensagem.get('text', {}).get('body', '')
+            numero_remetente = mensagem.get('from', '')
+            
+            if texto:
+                resultado = agent.process_question(texto)
+                resposta = resultado.get('resposta', 'Não foi possível processar sua solicitação.')
+                
+                print(f"WhatsApp - De: {numero_remetente}")
+                print(f"Mensagem: {texto}")
+                print(f"Resposta: {resposta}")
+                print(f"Ação: {resultado.get('acao_final')}")
+                
+                # Aqui você integraria com a API do WhatsApp para enviar a resposta
+                
+                return jsonify({'status': 'success', 'resposta': resposta})
+        
+        return jsonify({'status': 'no_message'})
+    
+    except Exception as e:
+        print(f"Erro no webhook: {e}")
+        return jsonify({'erro': str(e)}), 500
+
+def iniciar_monitoramento():
+    """Inicia o monitoramento em background"""
+    if agent:
+        thread = Thread(target=agent.manter_ativo)
+        thread.daemon = True
+        thread.start()
+
+# Inicia monitoramento automaticamente
+iniciar_monitoramento()
+
+if __name__ == '__main__':
+    print("🚀 Iniciando Service Desk Agent Web Server...")
+    
+    # Configuração para desenvolvimento local ou produção
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_ENV') == 'development'
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
+else:
+    # Para produção com Gunicorn
+    print("🚀 Service Desk Agent iniciado em produção")
