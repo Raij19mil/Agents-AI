@@ -200,7 +200,7 @@ for msg_teste in testes:
 
 """Aula **3**"""
 
-!pip install -q --upgrade langgraph gunicorn Agents-AI:app
+!pip install -q --upgrade langgraph gunicorn 2tentativa:app
 
 from typing import TypedDict, Optional
 
